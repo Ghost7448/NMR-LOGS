@@ -10,6 +10,7 @@ const {
   AuditLogEvent,
   PermissionsBitField
 } = require('discord.js');
+const { DatabaseSync } = require('node:sqlite');
 
 // ============================================
 // NMR LOGS V3 ULTIMATE - DEEP SERVER LOGGER
@@ -55,6 +56,85 @@ const client = new Client({
 
 const messageCache = new Map();
 const inviteCache = new Map();
+
+// Persistent message database: deleted messages can still be recovered after cache expiry/restart.
+// Uses Node's built-in SQLite support (Node 22.5+ / Node 24+) so no native sqlite3 package is required.
+const messageDb = new DatabaseSync(path.join(__dirname, 'messages.db'));
+messageDb.exec(`
+  CREATE TABLE IF NOT EXISTS messages (
+    id TEXT PRIMARY KEY,
+    guild_id TEXT NOT NULL,
+    channel_id TEXT,
+    channel_name TEXT,
+    author_id TEXT,
+    author_tag TEXT,
+    avatar TEXT,
+    content TEXT,
+    attachments TEXT,
+    embeds TEXT,
+    created_timestamp INTEGER,
+    updated_timestamp INTEGER
+  )
+`);
+
+function dbRun(sql, params = []) {
+  const stmt = messageDb.prepare(sql);
+  return stmt.run(...params);
+}
+
+function dbGet(sql, params = []) {
+  const stmt = messageDb.prepare(sql);
+  return stmt.get(...params);
+}
+
+async function saveMessageToDb(message) {
+  if (!message?.guild || !message.id) return;
+
+  const attachments = [...(message.attachments?.values?.() || [])].map(a => ({
+    name: a.name, url: a.url, contentType: a.contentType
+  }));
+  const embeds = [...(message.embeds || [])].map(e => ({
+    title: e.title,
+    description: e.description,
+    url: e.url,
+    fields: (e.fields || []).map(f => ({ name: f.name, value: f.value, inline: f.inline })),
+    author: e.author ? { name: e.author.name, url: e.author.url, iconURL: e.author.iconURL } : null,
+    footer: e.footer ? { text: e.footer.text, iconURL: e.footer.iconURL } : null
+  }));
+
+  dbRun(`
+    INSERT INTO messages (id, guild_id, channel_id, channel_name, author_id, author_tag, avatar, content, attachments, embeds, created_timestamp, updated_timestamp)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      channel_id=excluded.channel_id, channel_name=excluded.channel_name,
+      author_id=excluded.author_id, author_tag=excluded.author_tag, avatar=excluded.avatar,
+      content=excluded.content, attachments=excluded.attachments, embeds=excluded.embeds,
+      updated_timestamp=excluded.updated_timestamp
+  `, [
+    message.id, message.guild.id, message.channel?.id || null, message.channel?.name || null,
+    message.author?.id || null, message.author?.tag || null, message.author?.displayAvatarURL?.() || null,
+    message.content || '', JSON.stringify(attachments), JSON.stringify(embeds),
+    message.createdTimestamp || Date.now(), Date.now()
+  ]);
+}
+
+async function getMessageFromDb(messageId) {
+  if (!messageId) return null;
+  const row = dbGet('SELECT * FROM messages WHERE id = ?', [messageId]);
+  if (!row) return null;
+  return {
+    id: row.id, content: row.content || '', authorId: row.author_id, authorTag: row.author_tag,
+    avatar: row.avatar, channelId: row.channel_id, channelName: row.channel_name,
+    attachments: JSON.parse(row.attachments || '[]'), embeds: JSON.parse(row.embeds || '[]'),
+    createdTimestamp: row.created_timestamp
+  };
+}
+
+// Keep deleted-message records permanently so their content remains available after deletion/restart.
+async function deleteMessageFromDb(messageId) {
+  // Intentionally not deleting rows. Kept for compatibility with the existing code path.
+  return;
+}
 
 const COLORS = {
   info: 0x5865F2,
@@ -268,6 +348,14 @@ async function findVoiceAudit(guild, type, channelId, maxAge = 30000) {
 // For message deletion, Discord's audit entry target is the message author.
 // Also verify the channel whenever Discord provides it.
 async function findMessageDeleteAudit(guild, authorId, channelId) {
+  const cacheKey = `${guild.id}:${authorId || ''}`;
+  const cached = messageDeleteAuditCache.get(cacheKey);
+  if (cached && Date.now() - cached.createdTimestamp <= 30000) {
+    const extra = cached.extra || {};
+    const auditChannel = extra.channelId || extra.channel_id || extra.channel?.id;
+    if (!channelId || !auditChannel || auditChannel === channelId) return cached;
+  }
+
   for (let attempt = 0; attempt < 7; attempt++) {
     if (attempt) await wait(500);
     try {
@@ -288,13 +376,20 @@ async function findMessageDeleteAudit(guild, authorId, channelId) {
         return !channelId || !auditChannel || auditChannel === channelId;
       });
 
-      if (exact) return exact;
+      if (exact) {
+        messageDeleteAuditCache.set(cacheKey, exact);
+        setTimeout(() => {
+          const current = messageDeleteAuditCache.get(cacheKey);
+          if (current?.id === exact.id) messageDeleteAuditCache.delete(cacheKey);
+        }, 60000);
+        return exact;
+      }
     } catch {}
   }
   return null;
 }
 
-function saveMessage(message) {
+async function saveMessage(message) {
   messageCache.set(message.id, {
     id: message.id,
     content: message.content || '',
@@ -315,6 +410,9 @@ function saveMessage(message) {
     })),
     createdTimestamp: message.createdTimestamp
   });
+
+  // Persist before deletion so the content survives cache expiry and bot restarts.
+  await saveMessageToDb(message);
 
   setTimeout(() => messageCache.delete(message.id), 24 * 60 * 60 * 1000);
 }
@@ -515,16 +613,18 @@ client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
 // MESSAGE LOGS - CACHE EVERYTHING
 // ============================================
 
-client.on(Events.MessageCreate, message => {
+client.on(Events.MessageCreate, async message => {
   if (!message.guild || !isSource(message.guild)) return;
-  if (message.author.bot && !CONFIG.logBotMessages) return;
-  saveMessage(message);
+  // Always persist messages (including bot embeds) so deleted-message logs
+  // can recover their content even when bot-message logging is disabled.
+  await saveMessage(message);
 });
 
 client.on(Events.MessageDelete, async message => {
   if (!message.guild || !isSource(message.guild)) return;
 
-  const saved = messageCache.get(message.id);
+  const cached = messageCache.get(message.id);
+  const saved = cached || await getMessageFromDb(message.id).catch(() => null);
 
   if (message.partial) {
     await message.fetch().catch(() => null);
@@ -533,9 +633,23 @@ client.on(Events.MessageDelete, async message => {
   const authorId = message.author?.id || saved?.authorId;
   const audit = await findMessageDeleteAudit(message.guild, authorId, message.channelId || saved?.channelId);
 
-  // MessageDelete does not include the message body when the message is partial.
-  // The local messageCache is therefore the only reliable source after deletion.
-  const content = message.content || saved?.content || 'تعذر استرجاع محتوى الرسالة (لم يكن محفوظًا قبل الحذف)';
+  // Deleted bot embeds often have no text in message.content. Recover the
+  // original embed data from the persistent DB when content is empty.
+  let content = message.content || saved?.content || '';
+  if (!content && saved?.embeds?.length) {
+    const embedParts = saved.embeds.slice(0, 10).map((e, i) => {
+      const parts = [];
+      if (e.title) parts.push(`**${e.title}**`);
+      if (e.description) parts.push(e.description);
+      if (e.fields?.length) {
+        parts.push(e.fields.slice(0, 10).map(f => `**${f.name}**: ${f.value}`).join('\n'));
+      }
+      if (e.url) parts.push(e.url);
+      return parts.filter(Boolean).join('\n') || `Embed ${i + 1}`;
+    });
+    content = embedParts.join('\n\n');
+  }
+  if (!content) content = 'تعذر استرجاع محتوى الرسالة (لم يتم حفظ محتواها قبل الحذف)';
   const attachments = message.attachments?.size
     ? [...message.attachments.values()]
     : (saved?.attachments || []);
@@ -557,11 +671,11 @@ client.on(Events.MessageDelete, async message => {
       { name: '💬 الرسالة المحذوفة', value: code(content) },
       {
         name: '🛡️ تم الحذف بواسطة',
-        // Discord does not create a MessageDelete audit entry when a user deletes
-        // their own message. In that case, fall back to the message author.
+        // Only Audit Logs can identify a moderator/bot that deleted another
+        // user's message. Never attribute a moderator deletion to the message author.
         value: audit?.executor
           ? userInfo(audit.executor)
-          : (authorId ? `<@${authorId}>\n\`${authorId}\`` : 'غير معروف')
+          : 'غير معروف'
       }
     ]
   });
@@ -578,6 +692,7 @@ client.on(Events.MessageDelete, async message => {
     });
   }
 
+  // Keep the row in the DB intentionally; this is the permanent backup used by deleted-message logs.
   messageCache.delete(message.id);
 });
 
@@ -585,10 +700,11 @@ client.on(Events.MessageDeleteBulk, async messages => {
   const first = messages.first();
   if (!first?.guild || !isSource(first.guild)) return;
 
-  const list = messages.map(msg => {
-    const saved = messageCache.get(msg.id);
+  const rows = await Promise.all(messages.map(async msg => {
+    const saved = messageCache.get(msg.id) || await getMessageFromDb(msg.id).catch(() => null);
     return `• **${msg.author?.tag || saved?.authorTag || 'Unknown'}**: ${trim(msg.content || saved?.content || 'بدون نص', 180)}`;
-  }).join('\n');
+  }));
+  const list = rows.join('\n');
 
   await sendLog('logs', {
     title: '🗑️ BULK MESSAGE DELETE',
@@ -628,7 +744,7 @@ client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
     ]
   });
 
-  saveMessage(newMessage);
+  await saveMessage(newMessage);
 });
 
 // ============================================
@@ -1148,6 +1264,7 @@ client.on(Events.GuildStickerDelete, async sticker => {
 
 const auditSeen = new Set();
 const channelUpdateAuditCache = new Map();
+const messageDeleteAuditCache = new Map();
 
 client.on(Events.GuildAuditLogEntryCreate, async (entry, guild) => {
   if (!isSource(guild)) return;
@@ -1156,6 +1273,14 @@ client.on(Events.GuildAuditLogEntryCreate, async (entry, guild) => {
   if (auditSeen.has(key)) return;
   auditSeen.add(key);
   setTimeout(() => auditSeen.delete(key), 60000);
+
+  if (entry.action === AuditLogEvent.MessageDelete && entry.targetId) {
+    messageDeleteAuditCache.set(`${guild.id}:${entry.targetId}`, entry);
+    setTimeout(() => {
+      const current = messageDeleteAuditCache.get(`${guild.id}:${entry.targetId}`);
+      if (current?.id === entry.id) messageDeleteAuditCache.delete(`${guild.id}:${entry.targetId}`);
+    }, 60000);
+  }
 
   if (
     [
