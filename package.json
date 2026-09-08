@@ -1,0 +1,14 @@
+{
+  "name": "nmr-logs",
+  "version": "1.0.0",
+  "description": "NMR UltimateDiscord Logs Bot",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.21.0",
+    "dotenv": "^16.6.1"
+  }
+}
