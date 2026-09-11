@@ -735,46 +735,22 @@ async function findVoiceAudit(
 
   const types = Array.isArray(type) ? type : [type];
 
-  // For MOVE/DISCONNECT the executor must be a different user from the
-  // member whose voice state changed. This prevents a bad/self-matching
-  // audit result from being displayed as "بواسطة" the moved member.
-  const validEntry = entry => {
-    if (!entry || !entry.executorId) return false;
-    if (!entry.targetId || entry.targetId !== memberId) return false;
-    if (entry.executorId === memberId) return false;
-    if (!isFreshAudit(entry, maxAge)) return false;
-
-    const consumedUntil = consumedAuditEntries.get(
-      `${guild.id}:${entry.id}`
-    );
-    if (consumedUntil && consumedUntil > Date.now()) return false;
-
-    if (channelId) {
-      const extra = entry.extra || {};
-      const auditChannel =
-        extra.channelId ||
-        extra.channel_id ||
-        extra.channel?.id;
-
-      if (auditChannel && auditChannel !== channelId) return false;
-    }
-
-    return true;
-  };
-
   // First use entries received through GuildAuditLogEntryCreate.
   for (const action of types) {
     const cached = voiceAuditCache.get(
       voiceAuditCacheKey(guild.id, action, memberId)
     );
 
-    if (validEntry(cached)) {
+    if (
+      isFreshAudit(cached, maxAge) &&
+      (!channelId || !cached.extra?.channelId || cached.extra.channelId === channelId) &&
+      cached.executorId
+    ) {
       markAuditConsumed(guild, cached, 10000);
       return cached;
     }
   }
 
-  // Audit logs can lag behind VoiceStateUpdate, so retry briefly.
   for (let attempt = 0; attempt < 10; attempt++) {
     if (attempt) await wait(450);
 
@@ -786,7 +762,28 @@ async function findVoiceAudit(
         });
 
         const candidates = [...logs.entries.values()]
-          .filter(validEntry)
+          .filter(entry => {
+            if (!entry || !entry.executorId) return false;
+            if (entry.targetId !== memberId) return false;
+            if (!isFreshAudit(entry, maxAge)) return false;
+
+            const consumedUntil = consumedAuditEntries.get(
+              `${guild.id}:${entry.id}`
+            );
+            if (consumedUntil && consumedUntil > Date.now()) return false;
+
+            if (channelId) {
+              const extra = entry.extra || {};
+              const auditChannel =
+                extra.channelId ||
+                extra.channel_id ||
+                extra.channel?.id;
+
+              if (auditChannel && auditChannel !== channelId) return false;
+            }
+
+            return true;
+          })
           .sort((a, b) => b.createdTimestamp - a.createdTimestamp);
 
         if (!candidates.length) continue;
@@ -798,7 +795,7 @@ async function findVoiceAudit(
     }
   }
 
-  // No reliable executor = do not guess.
+  // Never guess an executor for an administrative voice action.
   return null;
 }
 
@@ -1637,12 +1634,9 @@ client.on(
         30000
       );
 
-      const executor = audit?.executorId
-        ? (audit.executor || await client.users.fetch(audit.executorId).catch(() => null))
-        : null;
-
-      // Admin disconnect: show the real executor.
-      if (executor) {
+      // A manual self-leave is a valid voice log. An administrative disconnect
+      // is only logged when Discord identifies the executor.
+      if (audit?.executorId) {
         await sendLog('voice', {
           title: '📤 VOICE DISCONNECT',
           description: '**تم فصل العضو من الروم الصوتي**',
@@ -1656,12 +1650,11 @@ client.on(
             },
             {
               name: '🛡️ بواسطة',
-              value: userInfo(executor)
+              value: userInfo(audit.executor)
             }
           ]
         });
       } else {
-        // Normal user leave.
         await sendLog('voice', {
           title: '📤 VOICE LEAVE',
           description: '**العضو خرج من الروم الصوتي**',
@@ -1694,13 +1687,10 @@ client.on(
         30000
       );
 
-      const executor = audit?.executorId
-        ? (audit.executor || await client.users.fetch(audit.executorId).catch(() => null))
-        : null;
-
+      // Self move has no administrative executor and is still a useful log.
       await sendLog('voice', {
         title: '🔁 VOICE MOVE',
-        description: executor
+        description: audit?.executorId
           ? '**تم نقل العضو بين الرومات الصوتية**'
           : '**العضو انتقل بين الرومات الصوتية**',
         color: COLORS.voice,
@@ -1717,8 +1707,8 @@ client.on(
           },
           {
             name: '🛡️ بواسطة',
-            value: executor
-              ? userInfo(executor)
+            value: audit?.executorId
+              ? userInfo(audit.executor)
               : userInfo(user)
           }
         ]
@@ -2590,6 +2580,15 @@ client.on(
     ) {
       changes.push(
         `🔔 **قابلة للمنشن:** ${oldRole.mentionable ? 'نعم' : 'لا'} ➜ ${newRole.mentionable ? 'نعم' : 'لا'}`
+      );
+    }
+
+    if (
+      oldRole.position !==
+      newRole.position
+    ) {
+      changes.push(
+        `↕️ **الترتيب:** ${oldRole.position} ➜ ${newRole.position}`
       );
     }
 
