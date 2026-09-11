@@ -764,7 +764,7 @@ function getQueuedVoiceAudits(guild, action) {
   return list;
 }
 
-async function findVoiceAudit(guild, type, memberId, channelId, maxAge = 7000) {
+async function findVoiceAudit(guild, type, memberId, channelId, maxAge = 15000) {
   if (!guild || !memberId) return null;
   const types = Array.isArray(type) ? type : [type];
 
@@ -776,12 +776,22 @@ async function findVoiceAudit(guild, type, memberId, channelId, maxAge = 7000) {
     if (consumedUntil && consumedUntil > Date.now()) return false;
 
     const auditChannel = getAuditChannelId(entry);
-    if (channelId && auditChannel && auditChannel !== channelId) return false;
+    const targetId = entry.targetId ? String(entry.targetId) : null;
+    const wantedMemberId = String(memberId);
 
-    // Exact target is best. If target_id is absent, only accept an unambiguous
-    // single-member entry for the exact channel.
-    if (entry.targetId) return entry.targetId === memberId;
-    return getAuditCount(entry) === 1 && Boolean(auditChannel) && auditChannel === channelId;
+    if (channelId && auditChannel && String(auditChannel) !== String(channelId)) return false;
+
+    // Exact target is the strongest correlation. Discord may omit target_id
+    // for MEMBER_DISCONNECT/MEMBER_MOVE and expose only channel_id/count.
+    if (targetId) return targetId === wantedMemberId;
+
+    // When target_id is missing, accept only a single-member audit action.
+    // Prefer the exact old channel when Discord provides it. If Discord omits
+    // channel_id as well, the fresh single-member entry is still usable because
+    // the VoiceStateUpdate itself identifies the member that just left.
+    if (getAuditCount(entry) !== 1) return false;
+    if (channelId && auditChannel) return String(auditChannel) === String(channelId);
+    return true;
   };
 
   for (const action of types) {
@@ -801,7 +811,7 @@ async function findVoiceAudit(guild, type, memberId, channelId, maxAge = 7000) {
     }
   }
 
-  for (let attempt = 0; attempt < 12; attempt++) {
+  for (let attempt = 0; attempt < 20; attempt++) {
     if (attempt) await wait(350);
     for (const action of types) {
       try {
@@ -1650,12 +1660,16 @@ client.on(
         AuditLogEvent.MemberDisconnect,
         user.id,
         oldState.channelId,
-        30000
+        15000
       );
 
       const executor = audit?.executorId
         ? (audit.executor || await client.users.fetch(audit.executorId).catch(() => null))
         : null;
+
+      if (!audit) {
+        console.warn(`[NMR VOICE] No MemberDisconnect audit match for ${user.id} in ${oldState.channelId || 'unknown-channel'}.`);
+      }
 
       // Admin disconnect: show the real executor.
       if (executor) {
