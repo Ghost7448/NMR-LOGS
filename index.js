@@ -1792,8 +1792,9 @@ client.on(
       ['selfVideo', '📹 CAMERA', 'العضو قام بتغيير حالة الكاميرا', COLORS.voice]
     ];
 
-    for (const [key, title, description, color] of selfChanges) {
-      if (oldState[key] === newState[key]) continue;
+    if (!joined && !disconnected && !moved) {
+      for (const [key, title, description, color] of selfChanges) {
+        if (Boolean(oldState[key]) === Boolean(newState[key])) continue;
 
       await sendLog('voice', {
         title,
@@ -1815,15 +1816,17 @@ client.on(
             value: userInfo(user)
           }
         ]
-      });
+        });
+      }
     }
 
     // ------------------------------
     // REQUEST TO SPEAK
     // ------------------------------
     if (
-      oldState.requestToSpeakTimestamp?.valueOf() !==
-      newState.requestToSpeakTimestamp?.valueOf()
+      !joined && !disconnected && !moved &&
+      Boolean(oldState.requestToSpeakTimestamp) !==
+      Boolean(newState.requestToSpeakTimestamp)
     ) {
       const requested = Boolean(newState.requestToSpeakTimestamp);
 
