@@ -1652,65 +1652,74 @@ client.on(
     }
 
     // ------------------------------
-    // DISCONNECT
-    // ------------------------------
-    if (disconnected) {
-      const audit = await findVoiceAudit(
-        guild,
-        AuditLogEvent.MemberDisconnect,
-        user.id,
-        oldState.channelId,
-        15000
-      );
+// DISCONNECT
+// ------------------------------
+if (disconnected) {
+  // Discord may take a moment to create the audit-log entry.
+  // Wait briefly before deciding that this was a normal leave.
+  await wait(1200);
 
-      const executor = audit?.executorId
-        ? (audit.executor || await client.users.fetch(audit.executorId).catch(() => null))
-        : null;
+  const audit = await findVoiceAudit(
+    guild,
+    AuditLogEvent.MemberDisconnect,
+    user.id,
+    oldState.channelId,
+    20000
+  );
 
-      if (!audit) {
-        console.warn(`[NMR VOICE] No MemberDisconnect audit match for ${user.id} in ${oldState.channelId || 'unknown-channel'}.`);
-      }
+  const executor = audit?.executorId
+    ? (
+        audit.executor ||
+        await client.users.fetch(audit.executorId).catch(() => null)
+      )
+    : null;
 
-      // Admin disconnect: show the real executor.
-      if (executor) {
-        await sendLog('voice', {
-          title: '📤 VOICE DISCONNECT',
-          description: '**تم فصل العضو من الروم الصوتي**',
-          color: COLORS.warning,
-          thumbnail: user.displayAvatarURL(),
-          fields: [
-            ...base,
-            {
-              name: '📍 الروم السابق',
-              value: channelText(oldState)
-            },
-            {
-              name: '🛡️ بواسطة',
-              value: userInfo(executor)
-            }
-          ]
-        });
-      } else {
-        // Normal user leave.
-        await sendLog('voice', {
-          title: '📤 VOICE LEAVE',
-          description: '**العضو خرج من الروم الصوتي**',
-          color: COLORS.warning,
-          thumbnail: user.displayAvatarURL(),
-          fields: [
-            ...base,
-            {
-              name: '📍 الروم السابق',
-              value: channelText(oldState)
-            },
-            {
-              name: '🛡️ بواسطة',
-              value: userInfo(user)
-            }
-          ]
-        });
-      }
-    }
+  // ==============================
+  // ADMIN / STAFF DISCONNECT
+  // ==============================
+  if (executor && executor.id !== user.id) {
+    await sendLog('voice', {
+      title: '📤 VOICE DISCONNECT',
+      description: '**تم فصل العضو من الروم الصوتي بواسطة إداري**',
+      color: COLORS.danger,
+      thumbnail: user.displayAvatarURL(),
+      fields: [
+        ...base,
+        {
+          name: '📍 الروم السابق',
+          value: channelText(oldState)
+        },
+        {
+          name: '🛡️ بواسطة',
+          value: userInfo(executor)
+        }
+      ]
+    });
+  }
+
+  // ==============================
+  // NORMAL USER LEAVE
+  // ==============================
+  else {
+    await sendLog('voice', {
+      title: '📤 VOICE LEAVE',
+      description: '**العضو خرج من الروم الصوتي بنفسه**',
+      color: COLORS.warning,
+      thumbnail: user.displayAvatarURL(),
+      fields: [
+        ...base,
+        {
+          name: '📍 الروم السابق',
+          value: channelText(oldState)
+        },
+        {
+          name: '🛡️ بواسطة',
+          value: userInfo(user)
+        }
+      ]
+    });
+  }
+}
 
     // ------------------------------
     // MOVE
