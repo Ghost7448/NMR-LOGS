@@ -3349,131 +3349,153 @@ client.on(
       });
     }
 
-    const added =
-      newMember.roles.cache.filter(
-        r =>
-          !oldMember.roles.cache.has(
-            r.id
-          )
-      );
+    const added = newMember.roles.cache.filter(
+  role => !oldMember.roles.cache.has(role.id)
+);
 
-    const removed =
-      oldMember.roles.cache.filter(
-        r =>
-          !newMember.roles.cache.has(
-            r.id
-          )
-      );
+const removed = oldMember.roles.cache.filter(
+  role => !newMember.roles.cache.has(role.id)
+);
 
-    if (
-      !added.size &&
-      !removed.size
-    ) {
-      return;
-    }
+if (!added.size && !removed.size) {
+  return;
+}
 
-    // Strict role attribution: if Discord did not expose the matching
-    // Audit Log entry (executor + target + changed role), do NOT send a log.
-    let audit = null;
+// ================================
+// ROLE AUDIT LOG
+// ================================
+let audit = null;
 
-    try {
-      const actionKey = added.size && !removed.size
-        ? '$add'
-        : removed.size && !added.size
-          ? '$remove'
-          : null;
+const actionKey =
+  added.size && !removed.size
+    ? '$add'
+    : removed.size && !added.size
+      ? '$remove'
+      : null;
 
-      const changedRoleIds = new Set([
-        ...added.keys(),
-        ...removed.keys()
-      ]);
+try {
+  const changedRoleIds = new Set([
+    ...added.keys(),
+    ...removed.keys()
+  ]);
 
-      audit = await findStrictMemberRoleAudit(
-        newMember.guild,
-        newMember.id,
-        changedRoleIds,
-        actionKey,
-        30000
-      );
-    } catch {}
+  audit = await findStrictMemberRoleAudit(
+    newMember.guild,
+    newMember.id,
+    changedRoleIds,
+    actionKey,
+    30000
+  );
+} catch (error) {
+  console.warn(
+    `[NMR ROLES] Audit lookup failed: ${error.message}`
+  );
+}
 
-    // No Discord audit entry = no role log. This prevents false executor logs.
-    if (!audit?.executorId && !audit?.executor?.id) {
-      return;
-    }
+// لو مفيش Audit Log حقيقي للتغيير، متعملش لوج
+if (!audit?.executorId && !audit?.executor?.id) {
+  return;
+}
 
-    const fields = [
-      {
-        name: '👤 العضو',
-        value:
-          memberInfo(newMember)
-      }
-    ];
+// ================================
+// GET ONLY THE CHANGED ROLE(S)
+// ================================
+const auditRoleIds = new Set();
 
-    if (added.size) {
-      fields.push({
-        name:
-          `➕ الرولات المضافة (${added.size})`,
-        value:
-          trim(
-            [
-              ...added.values()
-            ]
-              .map(
-                r =>
-                  `• **${r.name}**\n\`${r.id}\``
-              )
-              .join('\n'),
-            1024
-          )
-      });
-    }
+for (const change of audit.changes || []) {
+  if (actionKey && change.key !== actionKey) {
+    continue;
+  }
 
-    if (removed.size) {
-      fields.push({
-        name:
-          `➖ الرولات المحذوفة (${removed.size})`,
-        value:
-          trim(
-            [
-              ...removed.values()
-            ]
-              .map(
-                r =>
-                  `• **${r.name}**\n\`${r.id}\``
-              )
-              .join('\n'),
-            1024
-          )
-      });
-    }
+  for (const id of auditChangeRoleIds(change)) {
+    auditRoleIds.add(String(id));
+  }
+}
 
-    fields.push({
-      name:
-        '🛡️ بواسطة',
-      value:
-        await executorInfo(audit)
-    });
+// أهم نقطة:
+// ناخد الرول اللي اتغيرت فقط، مش كل رولات العضو
+const loggedAdded = added.filter(role =>
+  auditRoleIds.has(String(role.id))
+);
 
-    await sendLog('roles', {
-      title:
-        added.size &&
-        removed.size
-          ? '🔄 MEMBER ROLES UPDATED'
-          : added.size
-            ? '➕ ROLE ADDED TO MEMBER'
-            : '➖ ROLE REMOVED FROM MEMBER',
+const loggedRemoved = removed.filter(role =>
+  auditRoleIds.has(String(role.id))
+);
 
-      description:
-        '**تم تغيير رولات عضو**',
+// لو الـ Audit Log أكد رول معينة، استخدمها فقط
+if (
+  actionKey === '$add' &&
+  !loggedAdded.size
+) {
+  return;
+}
 
-      color:
-        added.size
-          ? COLORS.success
-          : COLORS.danger,
+if (
+  actionKey === '$remove' &&
+  !loggedRemoved.size
+) {
+  return;
+}
 
-      fields
-    });
+const fields = [
+  {
+    name: '👤 العضو',
+    value: memberInfo(newMember)
+  }
+];
+
+if (loggedAdded.size) {
+  fields.push({
+    name: `➕ الرول المضافة (${loggedAdded.size})`,
+    value: trim(
+      [...loggedAdded.values()]
+        .map(
+          role =>
+            `• **${role.name}**\n\`${role.id}\``
+        )
+        .join('\n'),
+      1024
+    )
+  });
+}
+
+if (loggedRemoved.size) {
+  fields.push({
+    name: `➖ الرول المحذوفة (${loggedRemoved.size})`,
+    value: trim(
+      [...loggedRemoved.values()]
+        .map(
+          role =>
+            `• **${role.name}**\n\`${role.id}\``
+        )
+        .join('\n'),
+      1024
+    )
+  });
+}
+
+fields.push({
+  name: '🛡️ بواسطة',
+  value: await executorInfo(audit)
+});
+
+await sendLog('roles', {
+  title:
+    loggedAdded.size && loggedRemoved.size
+      ? '🔄 MEMBER ROLES UPDATED'
+      : loggedAdded.size
+        ? '➕ ROLE ADDED TO MEMBER'
+        : '➖ ROLE REMOVED FROM MEMBER',
+
+  description: '**تم تغيير رول للعضو**',
+
+  color:
+    loggedAdded.size
+      ? COLORS.success
+      : COLORS.danger,
+
+  fields
+});
   }
 );
 
