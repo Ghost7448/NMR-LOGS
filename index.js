@@ -2018,23 +2018,17 @@ client.on(
         COLORS.success,
       fields: [
         {
-          name: '📌 الاسم',
-          value:
-            `${channel.name}`
+          name: '📍 الروم',
+          value: channelMention(channel)
         },
-
         {
-          name: '🆔 ID',
-          value:
-            `\`${channel.id}\``
+          name: '📌 اسم الروم',
+          value: `\`${channel.name}\``
         },
-
         {
-          name: '📂 النوع',
-          value:
-            `${channel.type}`
+          name: '📂 نوع الروم',
+          value: `\`${channelTypeName(channel.type)}\``
         },
-
         {
           name:
             '🛡️ بواسطة',
@@ -2073,16 +2067,12 @@ client.on(
       fields: [
         {
           name: '📌 الاسم',
-          value:
-            `${channel.name}`
+          value: `\`${channel.name}\``
         },
-
         {
-          name: '🆔 ID',
-          value:
-            `\`${channel.id}\``
+          name: '📂 النوع',
+          value: `\`${channelTypeName(channel.type)}\``
         },
-
         {
           name:
             '🛡️ بواسطة',
@@ -3266,7 +3256,7 @@ client.on(
           name:
             '🔗 الدعوة',
           value:
-            `discord.gg/${invite.code}`
+            `\`discord.gg/${invite.code}\``
         },
 
         {
@@ -3340,7 +3330,7 @@ client.on(
           name:
             '🔗 Code',
           value:
-            invite.code
+            `${invite.code}`
         }
       ]
     });
