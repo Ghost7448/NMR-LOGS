@@ -2295,6 +2295,286 @@ client.on(
   }
 );
 
+
+// ============================================
+// THREAD LOGS - PUBLIC / PRIVATE
+// ============================================
+
+function threadTypeName(channel) {
+  if (!channel) return 'Unknown';
+
+  switch (channel.type) {
+    case 10:
+      return 'Announcement Thread';
+    case 11:
+      return 'Public Thread';
+    case 12:
+      return 'Private Thread';
+    default:
+      return 'Thread';
+  }
+}
+
+function threadInfo(channel) {
+  return `${channel}\n\`${channel.id}\``;
+}
+
+// THREAD CREATED
+client.on(
+  Events.ThreadCreate,
+  async thread => {
+    if (
+      !thread.guild ||
+      !isSource(thread.guild)
+    ) {
+      return;
+    }
+
+    const audit = await findAudit(
+      thread.guild,
+      AuditLogEvent.ThreadCreate,
+      thread.id,
+      20000
+    );
+
+    await sendLog('logs', {
+      title: '🧵 THREAD CREATED',
+      description: '**تم إنشاء Thread جديد**',
+      color: COLORS.success,
+
+      fields: [
+        {
+          name: '📍 الروم',
+          value: `${thread}`
+        },
+
+        {
+          name: '📝 اسم الـ Thread',
+          value: code(thread.name, 900)
+        },
+
+        {
+          name: '🔹 النوع',
+          value: code(threadTypeName(thread), 900)
+        },
+
+        {
+          name: '📂 الروم الأساسي',
+          value: thread.parent
+            ? `${thread.parent}`
+            : 'غير متاح'
+        },
+
+        {
+          name: '🆔 ID',
+          value: `\`${thread.id}\``
+        },
+
+        {
+          name: '🛡️ بواسطة',
+          value: await executorInfo(audit, thread.ownerId
+            ? await client.users.fetch(thread.ownerId).catch(() => null)
+            : null)
+        }
+      ]
+    });
+  }
+);
+
+
+// THREAD DELETED
+client.on(
+  Events.ThreadDelete,
+  async thread => {
+    if (
+      !thread.guild ||
+      !isSource(thread.guild)
+    ) {
+      return;
+    }
+
+    const audit = await findAudit(
+      thread.guild,
+      AuditLogEvent.ThreadDelete,
+      thread.id,
+      20000
+    );
+
+    await sendLog('logs', {
+      title: '🗑️ THREAD DELETED',
+      description: '**تم حذف Thread**',
+      color: COLORS.danger,
+
+      fields: [
+        {
+          name: '📍 الروم',
+          value: `#${thread.name}`
+        },
+
+        {
+          name: '📝 الاسم',
+          value: code(thread.name, 900)
+        },
+
+        {
+          name: '🔹 النوع',
+          value: code(threadTypeName(thread), 900)
+        },
+
+        {
+          name: '📂 الروم الأساسي',
+          value: thread.parent
+            ? `${thread.parent}`
+            : 'غير متاح'
+        },
+
+        {
+          name: '🆔 ID',
+          value: `\`${thread.id}\``
+        },
+
+        {
+          name: '🛡️ بواسطة',
+          value: await executorInfo(audit)
+        }
+      ]
+    });
+  }
+);
+
+
+// THREAD UPDATED
+client.on(
+  Events.ThreadUpdate,
+  async (
+    oldThread,
+    newThread
+  ) => {
+    if (
+      !newThread.guild ||
+      !isSource(newThread.guild)
+    ) {
+      return;
+    }
+
+    const changes = [];
+
+    // الاسم
+    if (
+      oldThread.name !==
+      newThread.name
+    ) {
+      changes.push(
+        `📝 **الاسم:** ${oldThread.name} ➜ ${newThread.name}`
+      );
+    }
+
+    // النوع
+    if (
+      oldThread.type !==
+      newThread.type
+    ) {
+      changes.push(
+        `🔹 **النوع:** ${threadTypeName(oldThread)} ➜ ${threadTypeName(newThread)}`
+      );
+    }
+
+    // Archived
+    if (
+      oldThread.archived !==
+      newThread.archived
+    ) {
+      changes.push(
+        `📦 **Archived:** ${oldThread.archived ? 'نعم' : 'لا'} ➜ ${newThread.archived ? 'نعم' : 'لا'}`
+      );
+    }
+
+    // Locked
+    if (
+      oldThread.locked !==
+      newThread.locked
+    ) {
+      changes.push(
+        `🔒 **Locked:** ${oldThread.locked ? 'نعم' : 'لا'} ➜ ${newThread.locked ? 'نعم' : 'لا'}`
+      );
+    }
+
+    // Auto Archive Duration
+    if (
+      oldThread.autoArchiveDuration !==
+      newThread.autoArchiveDuration
+    ) {
+      changes.push(
+        `⏱️ **Auto Archive:** ${oldThread.autoArchiveDuration ?? 'غير محدد'} ➜ ${newThread.autoArchiveDuration ?? 'غير محدد'} دقيقة`
+      );
+    }
+
+    // Slowmode
+    if (
+      oldThread.rateLimitPerUser !==
+      newThread.rateLimitPerUser
+    ) {
+      changes.push(
+        `🐌 **Slowmode:** ${oldThread.rateLimitPerUser ?? 0}s ➜ ${newThread.rateLimitPerUser ?? 0}s`
+      );
+    }
+
+    if (!changes.length) {
+      return;
+    }
+
+    const audit = await findAudit(
+      newThread.guild,
+      AuditLogEvent.ThreadUpdate,
+      newThread.id,
+      30000
+    );
+
+    await sendLog('logs', {
+      title: '✏️ THREAD UPDATED',
+      description: '**تم تعديل Thread**',
+      color: COLORS.warning,
+
+      fields: [
+        {
+          name: '📍 الروم',
+          value: `${newThread}`
+        },
+
+        {
+          name: '📝 الاسم',
+          value: code(newThread.name, 900)
+        },
+
+        {
+          name: '🔹 النوع',
+          value: code(threadTypeName(newThread), 900)
+        },
+
+        {
+          name: '📂 الروم الأساسي',
+          value: newThread.parent
+            ? `${newThread.parent}`
+            : 'غير متاح'
+        },
+
+        {
+          name: '📝 التغييرات',
+          value: trim(
+            changes.join('\n'),
+            1000
+          )
+        },
+
+        {
+          name: '🛡️ بواسطة',
+          value: await executorInfo(audit)
+        }
+      ]
+    });
+  }
+);
+
 // ============================================
 // PERMISSION DIFF HELPERS
 // ============================================
@@ -3353,29 +3633,55 @@ client.on(
     await sendLog('logs', {
       title:
         '🗑️ INVITE DELETED',
+
       description:
-        '**تم حذف دعوة**',
+        '**تم حذف دعوة من السيرفر**',
+
       color:
         COLORS.danger,
+
       fields: [
         {
           name:
-            '🔗 Code',
+            '🔗 الدعوة',
+
           value:
-            `${invite.code}`
+            `discord.gg/${invite.code}`
         },
 
         {
           name:
-            '👤 بواسطة',
+            '🔑 Code',
+
           value:
-            invite.inviter
-              ? userInfo(
-                  invite.inviter
-                )
-              : '⚠️ Discord لم يرسل بيانات منشئ الدعوة'
+            `\`${invite.code}\``
         },
 
+        {
+          name:
+            '📍 الروم',
+
+          value:
+            invite.channel
+              ? `${invite.channel}`
+              : 'بيانات الروم غير متاحة'
+        },
+
+        {
+          name:
+            '🛡️ تم الحذف بواسطة',
+
+          value:
+            await executorInfo(audit)
+        },
+
+        {
+          name:
+            '🕒 وقت الحذف',
+
+          value:
+            `<t:${Math.floor(Date.now() / 1000)}:F>`
+        }
       ]
     });
   }
