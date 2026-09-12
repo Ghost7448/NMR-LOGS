@@ -1834,59 +1834,74 @@ client.on(
     }
 
 // ------------------------------
-// DISCONNECT
+// DISCONNECT / LEAVE - INSTANT
 // ------------------------------
 if (disconnected) {
-  let audit = null;
 
-  // ==========================================
-  // 1) لو فيه Bulk Disconnect شغال حالياً
-  //    نستخدم نفس الـ executor لباقي الأعضاء
-  // ==========================================
-
-  audit = getVoiceDisconnectBatch(
+  // لو فيه Audit Cache جاهز، نعرف فورًا إنه Disconnect إداري
+  let audit = getVoiceDisconnectBatch(
     guild,
     oldState.channelId
   );
 
-  // ==========================================
-  // 2) لو مفيش Batch Cache
-  //    ندور على Audit Log للعضو نفسه
-  // ==========================================
-
+  // لو مفيش Cache، ابحث بسرعة جدًا فقط
+  // بدل ما نستنى findVoiceAudit بكل محاولاته
   if (!audit) {
-    audit = await findVoiceAudit(
-      guild,
-      AuditLogEvent.MemberDisconnect,
-      user.id,
-      oldState.channelId,
-      30000
-    );
+    try {
+      const logs = await guild.fetchAuditLogs({
+        type: AuditLogEvent.MemberDisconnect,
+        limit: 10
+      });
 
-    // أول عضو اتعرف إنه اتعمله Disconnect
-    // نحفظ الـ audit مؤقتاً عشان باقي الأعضاء
-    // في نفس العملية ياخدوا نفس الـ executor
-    if (audit?.executorId) {
-      setVoiceDisconnectBatch(
-        guild,
-        oldState.channelId,
-        audit
-      );
-    }
+      const now = Date.now();
+
+      audit = [...logs.entries.values()]
+        .filter(entry => {
+          if (!entry?.executorId) return false;
+
+          const age =
+            now - entry.createdTimestamp;
+
+          if (age < -1000 || age > 1500) {
+            return false;
+          }
+
+          if (
+            entry.targetId &&
+            entry.targetId !== user.id
+          ) {
+            return false;
+          }
+
+          return true;
+        })
+        .sort(
+          (a, b) =>
+            b.createdTimestamp -
+            a.createdTimestamp
+        )[0] || null;
+
+    } catch {}
   }
 
   // ==========================================
-  // 3) ADMIN DISCONNECT
+  // ADMIN DISCONNECT
   // ==========================================
-
   if (audit?.executorId) {
+
+    setVoiceDisconnectBatch(
+      guild,
+      oldState.channelId,
+      audit
+    );
+
     await sendLog('voice', {
       title: '📤 VOICE DISCONNECT',
 
       description:
         '**تم فصل العضو من الروم الصوتي بواسطة الإدارة**',
 
-      color: COLORS.danger,
+      color: COLORS.warning,
 
       thumbnail:
         user.displayAvatarURL(),
@@ -1896,26 +1911,23 @@ if (disconnected) {
 
         {
           name: '📍 الروم السابق',
-          value:
-            channelText(oldState)
+          value: channelText(oldState)
         },
 
         {
           name: '🛡️ بواسطة',
-          value:
-            userInfo(
-              audit.executor
-            )
+          value: userInfo(audit.executor)
         }
       ]
     });
+
   }
 
   // ==========================================
-  // 4) SELF LEAVE
+  // NORMAL LEAVE
   // ==========================================
-
   else {
+
     await sendLog('voice', {
       title: '📤 VOICE LEAVE',
 
@@ -1932,17 +1944,16 @@ if (disconnected) {
 
         {
           name: '📍 الروم السابق',
-          value:
-            channelText(oldState)
+          value: channelText(oldState)
         },
 
         {
           name: '🛡️ بواسطة',
-          value:
-            userInfo(user)
+          value: userInfo(user)
         }
       ]
     });
+
   }
 }
 
