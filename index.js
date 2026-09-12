@@ -62,6 +62,69 @@ const voiceAuditCache = new Map();
 const voiceAuditQueue = new Map();
 const consumedAuditEntries = new Map();
 
+// ============================================
+// BULK VOICE DISCONNECT CACHE
+// ============================================
+
+const voiceDisconnectBatchCache = new Map();
+
+function voiceDisconnectBatchKey(guildId, channelId) {
+  return `${guildId}:${channelId}`;
+}
+
+function setVoiceDisconnectBatch(guild, channelId, audit) {
+  if (!guild || !channelId || !audit?.executorId) return;
+
+  const key = voiceDisconnectBatchKey(
+    guild.id,
+    channelId
+  );
+
+  voiceDisconnectBatchCache.set(key, {
+    audit,
+    executorId: audit.executorId,
+    createdAt: Date.now()
+  });
+
+  setTimeout(() => {
+    const current =
+      voiceDisconnectBatchCache.get(key);
+
+    if (
+      current?.audit?.id === audit.id
+    ) {
+      voiceDisconnectBatchCache.delete(key);
+    }
+  }, 5000);
+}
+
+function getVoiceDisconnectBatch(
+  guild,
+  channelId
+) {
+  if (!guild || !channelId) return null;
+
+  const key = voiceDisconnectBatchKey(
+    guild.id,
+    channelId
+  );
+
+  const cached =
+    voiceDisconnectBatchCache.get(key);
+
+  if (!cached) return null;
+
+  if (
+    Date.now() - cached.createdAt >
+    5000
+  ) {
+    voiceDisconnectBatchCache.delete(key);
+    return null;
+  }
+
+  return cached.audit;
+}
+
 // Persistent message database: deleted messages can still be recovered after cache expiry/restart.
 // Uses Node's built-in SQLite support (Node 22.5+ / Node 24+) so no native sqlite3 package is required.
 const messageDb = new DatabaseSync(path.join(__dirname, 'messages.db'));
@@ -1770,70 +1833,113 @@ client.on(
       });
     }
 
-    // ------------------------------
+// ------------------------------
 // DISCONNECT
 // ------------------------------
 if (disconnected) {
-  // Discord may take a moment to create the audit-log entry.
-  // Wait briefly before deciding that this was a normal leave.
-  await wait(1200);
+  let audit = null;
 
-  const audit = await findVoiceAudit(
+  // ==========================================
+  // 1) لو فيه Bulk Disconnect شغال حالياً
+  //    نستخدم نفس الـ executor لباقي الأعضاء
+  // ==========================================
+
+  audit = getVoiceDisconnectBatch(
     guild,
-    AuditLogEvent.MemberDisconnect,
-    user.id,
-    oldState.channelId,
-    20000
+    oldState.channelId
   );
 
-  const executor = audit?.executorId
-    ? (
-        audit.executor ||
-        await client.users.fetch(audit.executorId).catch(() => null)
-      )
-    : null;
+  // ==========================================
+  // 2) لو مفيش Batch Cache
+  //    ندور على Audit Log للعضو نفسه
+  // ==========================================
 
-  // ==============================
-  // ADMIN / STAFF DISCONNECT
-  // ==============================
-  if (executor && executor.id !== user.id) {
+  if (!audit) {
+    audit = await findVoiceAudit(
+      guild,
+      AuditLogEvent.MemberDisconnect,
+      user.id,
+      oldState.channelId,
+      30000
+    );
+
+    // أول عضو اتعرف إنه اتعمله Disconnect
+    // نحفظ الـ audit مؤقتاً عشان باقي الأعضاء
+    // في نفس العملية ياخدوا نفس الـ executor
+    if (audit?.executorId) {
+      setVoiceDisconnectBatch(
+        guild,
+        oldState.channelId,
+        audit
+      );
+    }
+  }
+
+  // ==========================================
+  // 3) ADMIN DISCONNECT
+  // ==========================================
+
+  if (audit?.executorId) {
     await sendLog('voice', {
       title: '📤 VOICE DISCONNECT',
-      description: '**تم فصل العضو من الروم الصوتي بواسطة إداري**',
-      color: COLORS.danger,
-      thumbnail: user.displayAvatarURL(),
+
+      description:
+        '**تم فصل العضو من الروم الصوتي بواسطة الإدارة**',
+
+      color: COLORS.warning,
+
+      thumbnail:
+        user.displayAvatarURL(),
+
       fields: [
         ...base,
+
         {
           name: '📍 الروم السابق',
-          value: channelText(oldState)
+          value:
+            channelText(oldState)
         },
+
         {
           name: '🛡️ بواسطة',
-          value: userInfo(executor)
+          value:
+            userInfo(
+              audit.executor
+            )
         }
       ]
     });
   }
 
-  // ==============================
-  // NORMAL USER LEAVE
-  // ==============================
+  // ==========================================
+  // 4) SELF LEAVE
+  // ==========================================
+
   else {
     await sendLog('voice', {
       title: '📤 VOICE LEAVE',
-      description: '**العضو خرج من الروم الصوتي بنفسه**',
+
+      description:
+        '**العضو خرج من الروم الصوتي**',
+
       color: COLORS.warning,
-      thumbnail: user.displayAvatarURL(),
+
+      thumbnail:
+        user.displayAvatarURL(),
+
       fields: [
         ...base,
+
         {
           name: '📍 الروم السابق',
-          value: channelText(oldState)
+          value:
+            channelText(oldState)
         },
+
         {
           name: '🛡️ بواسطة',
-          value: userInfo(user)
+          value:
+            userInfo(user)
         }
       ]
     });
