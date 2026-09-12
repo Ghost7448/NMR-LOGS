@@ -1934,7 +1934,7 @@ if (disconnected) {
       description:
         '**العضو خرج من الروم الصوتي**',
 
-      color: COLORS.warning,
+      color: COLORS.danger,
 
       thumbnail:
         user.displayAvatarURL(),
