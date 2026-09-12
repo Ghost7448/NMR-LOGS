@@ -766,89 +766,184 @@ function getQueuedVoiceAudits(guild, action) {
 
 async function findVoiceAudit(guild, type, memberId, channelId, maxAge = 15000) {
   if (!guild || !memberId) return null;
+
   const types = Array.isArray(type) ? type : [type];
 
   const matches = entry => {
     if (!entry?.executorId) return false;
     if (!isFreshAudit(entry, maxAge)) return false;
+
+    // The executor cannot be the member who left by himself.
     if (entry.executorId === memberId) return false;
-    const consumedUntil = consumedAuditEntries.get(`${guild.id}:${entry.id}`);
-    if (consumedUntil && consumedUntil > Date.now()) return false;
 
     const auditChannel = getAuditChannelId(entry);
     const targetId = entry.targetId ? String(entry.targetId) : null;
     const wantedMemberId = String(memberId);
 
-    if (channelId && auditChannel && String(auditChannel) !== String(channelId)) return false;
+    const count = getAuditCount(entry);
 
-    // Exact target is the strongest correlation. Discord may omit target_id
-    // for MEMBER_DISCONNECT/MEMBER_MOVE and expose only channel_id/count.
-    if (targetId) return targetId === wantedMemberId;
+    // --------------------------------------------------
+    // MEMBER DISCONNECT
+    // Discord can put multiple disconnects into ONE
+    // audit-log entry.
+    // --------------------------------------------------
+    if (entry.action === AuditLogEvent.MemberDisconnect) {
 
-    // Discord can group multiple disconnects into one audit-log entry.
-if (entry.action === AuditLogEvent.MemberDisconnect) {
-  const count = getAuditCount(entry);
+      // If this is a grouped disconnect, DO NOT require
+      // target_id to match the current member.
+      if (count > 1) {
+        if (
+          channelId &&
+          auditChannel &&
+          String(auditChannel) !== String(channelId)
+        ) {
+          return false;
+        }
 
-  if (count < 1) return false;
+        return true;
+      }
 
-  if (channelId && auditChannel) {
-    return String(auditChannel) === String(channelId);
-  }
+      // Normal single disconnect.
+      if (targetId) {
+        return targetId === wantedMemberId;
+      }
 
-  return true;
-}
+      if (
+        channelId &&
+        auditChannel &&
+        String(auditChannel) !== String(channelId)
+      ) {
+        return false;
+      }
 
-// Other voice actions stay strict.
-if (getAuditCount(entry) !== 1) return false;
+      return true;
+    }
 
-if (channelId && auditChannel) {
-  return String(auditChannel) === String(channelId);
-}
+    // --------------------------------------------------
+    // OTHER VOICE ACTIONS
+    // --------------------------------------------------
 
-return true;
+    if (channelId && auditChannel) {
+      if (String(auditChannel) !== String(channelId)) {
+        return false;
+      }
+    }
+
+    // For MOVE, target_id should normally identify the member.
+    if (targetId) {
+      return targetId === wantedMemberId;
+    }
+
+    // If Discord omitted target_id, only accept a
+    // single-member audit entry.
+    if (count !== 1) return false;
+
+    return true;
   };
 
+  // --------------------------------------------------
+  // CACHE
+  // --------------------------------------------------
+
   for (const action of types) {
-    const cached = voiceAuditCache.get(voiceAuditCacheKey(guild.id, action, memberId));
+    const cached =
+      voiceAuditCache.get(
+        voiceAuditCacheKey(guild.id, action, memberId)
+      );
+
     if (matches(cached)) {
-  if (getAuditCount(cached) === 1) {
-    markAuditConsumed(guild, cached, 10000);
+
+      // IMPORTANT:
+      // Never consume grouped disconnect entries.
+      if (
+        entryIsSingleAudit(cached)
+      ) {
+        markAuditConsumed(guild, cached, 10000);
+      }
+
+      return cached;
+    }
   }
-  return cached;
-}
-  }
+
+  // --------------------------------------------------
+  // QUEUE
+  // --------------------------------------------------
 
   for (const action of types) {
-    const candidates = getQueuedVoiceAudits(guild, action).filter(matches).sort((a,b) => b.createdTimestamp - a.createdTimestamp);
+    const candidates =
+      getQueuedVoiceAudits(guild, action)
+        .filter(matches)
+        .sort(
+          (a, b) =>
+            b.createdTimestamp - a.createdTimestamp
+        );
+
     if (candidates.length) {
-  const entry = candidates[0];
+      const entry = candidates[0];
 
-  if (getAuditCount(entry) === 1) {
-    markAuditConsumed(guild, entry, 10000);
+      // Grouped disconnects must remain available
+      // for the other members in the same batch.
+      if (getAuditCount(entry) <= 1) {
+        markAuditConsumed(guild, entry, 10000);
+      }
+
+      return entry;
+    }
   }
 
-  return entry;
-}
-  }
+  // --------------------------------------------------
+  // FETCH DISCORD AUDIT LOG
+  // --------------------------------------------------
 
   for (let attempt = 0; attempt < 20; attempt++) {
-    if (attempt) await wait(350);
+
+    if (attempt) {
+      await wait(350);
+    }
+
     for (const action of types) {
       try {
-        const logs = await guild.fetchAuditLogs({ type: action, limit: 50 });
-        const candidates = [...logs.entries.values()].filter(matches).sort((a,b) => b.createdTimestamp - a.createdTimestamp);
-        if (!candidates.length) continue;
+        const logs =
+          await guild.fetchAuditLogs({
+            type: action,
+            limit: 50
+          });
+
+        const candidates =
+          [...logs.entries.values()]
+            .filter(matches)
+            .sort(
+              (a, b) =>
+                b.createdTimestamp -
+                a.createdTimestamp
+            );
+
+        if (!candidates.length) {
+          continue;
+        }
+
         const entry = candidates[0];
 
-if (getAuditCount(entry) === 1) {
-  markAuditConsumed(guild, entry, 10000);
-}
+        // DO NOT consume grouped disconnect entries.
+        if (getAuditCount(entry) <= 1) {
+          markAuditConsumed(
+            guild,
+            entry,
+            10000
+          );
+        }
 
-queueVoiceAuditEntry(guild, entry);
-return entry;
+        queueVoiceAuditEntry(
+          guild,
+          entry
+        );
+
+        return entry;
+
       } catch {}
     }
   }
+
   return null;
 }
 
