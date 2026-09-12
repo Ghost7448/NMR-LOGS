@@ -3613,6 +3613,10 @@ client.on(
   }
 );
 
+// ============================================
+// INVITE DELETE LOG - REAL EXECUTOR
+// ============================================
+
 client.on(
   Events.InviteDelete,
   async invite => {
@@ -3623,12 +3627,84 @@ client.on(
       return;
     }
 
-    const audit = await findAudit(
-      invite.guild,
-      AuditLogEvent.InviteDelete,
-      invite.code,
-      20000
-    );
+    let audit = null;
+
+    // Discord ممكن يتأخر في إضافة العملية للـ Audit Log
+    // لذلك نحاول عدة مرات قبل ما نقول غير محدد.
+    for (let attempt = 0; attempt < 15; attempt++) {
+      try {
+        const logs = await invite.guild.fetchAuditLogs({
+          type: AuditLogEvent.InviteDelete,
+          limit: 50
+        });
+
+        const now = Date.now();
+
+        const candidates = [
+          ...logs.entries.values()
+        ]
+          .filter(entry => {
+            if (!entry) return false;
+
+            const age =
+              now - entry.createdTimestamp;
+
+            // العملية لازم تكون حديثة
+            if (
+              age < -3000 ||
+              age > 30000
+            ) {
+              return false;
+            }
+
+            // لو Discord أعطى targetId
+            // لازم يطابق كود الدعوة
+            if (
+              entry.targetId &&
+              String(entry.targetId) !==
+                String(invite.code)
+            ) {
+              return false;
+            }
+
+            // لازم يكون فيه منفذ للعملية
+            if (!entry.executorId) {
+              return false;
+            }
+
+            return true;
+          })
+          .sort(
+            (a, b) =>
+              b.createdTimestamp -
+              a.createdTimestamp
+          );
+
+        if (candidates.length) {
+          audit = candidates[0];
+          break;
+        }
+      } catch (error) {
+        console.warn(
+          '[NMR INVITE DELETE] Audit fetch failed:',
+          error.message
+        );
+      }
+
+      // نستنى شوية قبل المحاولة التالية
+      await wait(500);
+    }
+
+    // لو لقينا Audit Log، نجيب الشخص الحقيقي
+    let executor = null;
+
+    if (audit?.executorId) {
+      executor =
+        audit.executor ||
+        await client.users
+          .fetch(audit.executorId)
+          .catch(() => null);
+    }
 
     await sendLog('logs', {
       title:
@@ -3646,7 +3722,7 @@ client.on(
             '🔗 الدعوة',
 
           value:
-            `discord.gg/${invite.code}`
+            `\`discord.gg/${invite.code}\``
         },
 
         {
@@ -3672,7 +3748,18 @@ client.on(
             '🛡️ تم الحذف بواسطة',
 
           value:
-            await executorInfo(audit)
+            executor
+              ? userInfo(executor)
+              : '⚠️ غير محدد - Discord لم يرسل Audit Log'
+        },
+
+        {
+          name:
+            '📝 السبب',
+
+          value:
+            audit?.reason ||
+            'لم يتم تقديم سبب'
         },
 
         {
@@ -3680,7 +3767,9 @@ client.on(
             '🕒 وقت الحذف',
 
           value:
-            `<t:${Math.floor(Date.now() / 1000)}:F>`
+            `<t:${Math.floor(
+              Date.now() / 1000
+            )}:F>`
         }
       ]
     });
