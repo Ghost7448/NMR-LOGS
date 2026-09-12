@@ -3363,7 +3363,19 @@ client.on(
             '🔗 Code',
           value:
             `${invite.code}`
-        }
+        },
+
+        {
+          name:
+            '👤 بواسطة',
+          value:
+            invite.inviter
+              ? userInfo(
+                  invite.inviter
+                )
+              : '⚠️ Discord لم يرسل بيانات منشئ الدعوة'
+        },
+
       ]
     });
   }
