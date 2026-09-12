@@ -1886,7 +1886,7 @@ if (disconnected) {
       description:
         '**تم فصل العضو من الروم الصوتي بواسطة الإدارة**',
 
-      color: COLORS.warning,
+      color: COLORS.danger,
 
       thumbnail:
         user.displayAvatarURL(),
