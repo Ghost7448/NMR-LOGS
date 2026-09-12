@@ -2245,8 +2245,15 @@ client.on(
       fields: [
         {
           name: '📍 الروم',
-          value:
-            `${newChannel.name} • \`${newChannel.id}\``
+          value: channelMention(newChannel)
+        },
+        {
+          name: '📌 اسم الروم',
+          value: `\`${newChannel.name}\``
+        },
+        {
+          name: '📂 نوع الروم',
+          value: `\`${channelTypeName(newChannel.type)}\``
         },
 
         ...(changes.length
