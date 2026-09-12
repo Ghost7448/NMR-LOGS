@@ -1988,6 +1988,31 @@ client.on(
   }
 );
 
+
+// ============================================
+// CHANNEL TYPE DISPLAY
+// ============================================
+
+function channelTypeName(type) {
+  const types = {
+    0: 'Text',
+    2: 'Voice',
+    4: 'Category',
+    5: 'Announcement',
+    10: 'Announcement Thread',
+    11: 'Thread Public',
+    12: 'Thread Private',
+    13: 'Stage',
+    15: 'Forum'
+  };
+
+  return types[type] || `Unknown (${type})`;
+}
+
+function channelMention(channel) {
+  return channel?.id ? `<#${channel.id}>` : 'غير متاح';
+}
+
 // ============================================
 // CHANNEL LOGS
 // ============================================
