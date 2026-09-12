@@ -59,7 +59,6 @@ const inviteCache = new Map();
 const auditEntryCache = new Map();
 // Cache fresh voice-related audit entries so VoiceStateUpdate can resolve the real executor.
 const voiceAuditCache = new Map();
-const voiceAuditQueue = new Map();
 const consumedAuditEntries = new Map();
 
 // Persistent message database: deleted messages can still be recovered after cache expiry/restart.
@@ -724,107 +723,79 @@ function markAuditConsumed(guild, entry, ttl = 10000) {
   }, 15000);
 }
 
-// Voice MOVE / DISCONNECT resolver.
-// Discord may omit target_id for these audit entries and instead provide channel_id/count.
-function voiceAuditActionKey(guildId, action) {
-  return `${guildId}:${action}`;
-}
-
-function getAuditChannelId(entry) {
-  const extra = entry?.extra || {};
-  return extra.channelId || extra.channel_id || extra.channel?.id || null;
-}
-
-function getAuditCount(entry) {
-  const raw = entry?.extra?.count;
-  if (raw === undefined || raw === null) return 1;
-  const n = Number(raw);
-  return Number.isFinite(n) ? n : 1;
-}
-
-function queueVoiceAuditEntry(guild, entry) {
-  if (!guild || !entry?.executorId) return;
-  if (![AuditLogEvent.MemberMove, AuditLogEvent.MemberDisconnect].includes(entry.action)) return;
-  const key = voiceAuditActionKey(guild.id, entry.action);
-  const list = (voiceAuditQueue.get(key) || []).filter(e => isFreshAudit(e, 15000));
-  list.unshift(entry);
-  voiceAuditQueue.set(key, list.slice(0, 20));
-  setTimeout(() => {
-    const current = (voiceAuditQueue.get(key) || []).filter(e => e.id !== entry.id && isFreshAudit(e, 15000));
-    if (current.length) voiceAuditQueue.set(key, current);
-    else voiceAuditQueue.delete(key);
-  }, 16000);
-}
-
-function getQueuedVoiceAudits(guild, action) {
-  const key = voiceAuditActionKey(guild.id, action);
-  const list = (voiceAuditQueue.get(key) || []).filter(e => isFreshAudit(e, 15000));
-  if (list.length) voiceAuditQueue.set(key, list);
-  else voiceAuditQueue.delete(key);
-  return list;
-}
-
-async function findVoiceAudit(guild, type, memberId, channelId, maxAge = 15000) {
+// Voice MOVE / DISCONNECT: exact member target + optional channel validation.
+async function findVoiceAudit(
+  guild,
+  type,
+  memberId,
+  channelId,
+  maxAge = 30000
+) {
   if (!guild || !memberId) return null;
+
   const types = Array.isArray(type) ? type : [type];
 
-  const matches = entry => {
-    if (!entry?.executorId) return false;
-    if (!isFreshAudit(entry, maxAge)) return false;
-    if (entry.executorId === memberId) return false;
-    const consumedUntil = consumedAuditEntries.get(`${guild.id}:${entry.id}`);
-    if (consumedUntil && consumedUntil > Date.now()) return false;
-
-    const auditChannel = getAuditChannelId(entry);
-    const targetId = entry.targetId ? String(entry.targetId) : null;
-    const wantedMemberId = String(memberId);
-
-    if (channelId && auditChannel && String(auditChannel) !== String(channelId)) return false;
-
-    // Exact target is the strongest correlation. Discord may omit target_id
-    // for MEMBER_DISCONNECT/MEMBER_MOVE and expose only channel_id/count.
-    if (targetId) return targetId === wantedMemberId;
-
-    // When target_id is missing, accept only a single-member audit action.
-    // Prefer the exact old channel when Discord provides it. If Discord omits
-    // channel_id as well, the fresh single-member entry is still usable because
-    // the VoiceStateUpdate itself identifies the member that just left.
-    if (getAuditCount(entry) !== 1) return false;
-    if (channelId && auditChannel) return String(auditChannel) === String(channelId);
-    return true;
-  };
-
+  // First use entries received through GuildAuditLogEntryCreate.
   for (const action of types) {
-    const cached = voiceAuditCache.get(voiceAuditCacheKey(guild.id, action, memberId));
-    if (matches(cached)) {
+    const cached = voiceAuditCache.get(
+      voiceAuditCacheKey(guild.id, action, memberId)
+    );
+
+    if (
+      isFreshAudit(cached, maxAge) &&
+      (!channelId || !cached.extra?.channelId || cached.extra.channelId === channelId) &&
+      cached.executorId
+    ) {
       markAuditConsumed(guild, cached, 10000);
       return cached;
     }
   }
 
-  for (const action of types) {
-    const candidates = getQueuedVoiceAudits(guild, action).filter(matches).sort((a,b) => b.createdTimestamp - a.createdTimestamp);
-    if (candidates.length) {
-      const entry = candidates[0];
-      markAuditConsumed(guild, entry, 10000);
-      return entry;
-    }
-  }
+  for (let attempt = 0; attempt < 10; attempt++) {
+    if (attempt) await wait(450);
 
-  for (let attempt = 0; attempt < 20; attempt++) {
-    if (attempt) await wait(350);
     for (const action of types) {
       try {
-        const logs = await guild.fetchAuditLogs({ type: action, limit: 50 });
-        const candidates = [...logs.entries.values()].filter(matches).sort((a,b) => b.createdTimestamp - a.createdTimestamp);
+        const logs = await guild.fetchAuditLogs({
+          type: action,
+          limit: 50
+        });
+
+        const candidates = [...logs.entries.values()]
+          .filter(entry => {
+            if (!entry || !entry.executorId) return false;
+            if (entry.targetId !== memberId) return false;
+            if (!isFreshAudit(entry, maxAge)) return false;
+
+            const consumedUntil = consumedAuditEntries.get(
+              `${guild.id}:${entry.id}`
+            );
+            if (consumedUntil && consumedUntil > Date.now()) return false;
+
+            if (channelId) {
+              const extra = entry.extra || {};
+              const auditChannel =
+                extra.channelId ||
+                extra.channel_id ||
+                extra.channel?.id;
+
+              if (auditChannel && auditChannel !== channelId) return false;
+            }
+
+            return true;
+          })
+          .sort((a, b) => b.createdTimestamp - a.createdTimestamp);
+
         if (!candidates.length) continue;
+
         const entry = candidates[0];
         markAuditConsumed(guild, entry, 10000);
-        queueVoiceAuditEntry(guild, entry);
         return entry;
       } catch {}
     }
   }
+
+  // Never guess an executor for an administrative voice action.
   return null;
 }
 
@@ -1660,19 +1631,12 @@ client.on(
         AuditLogEvent.MemberDisconnect,
         user.id,
         oldState.channelId,
-        15000
+        30000
       );
 
-      const executor = audit?.executorId
-        ? (audit.executor || await client.users.fetch(audit.executorId).catch(() => null))
-        : null;
-
-      if (!audit) {
-        console.warn(`[NMR VOICE] No MemberDisconnect audit match for ${user.id} in ${oldState.channelId || 'unknown-channel'}.`);
-      }
-
-      // Admin disconnect: show the real executor.
-      if (executor) {
+      // A manual self-leave is a valid voice log. An administrative disconnect
+      // is only logged when Discord identifies the executor.
+      if (audit?.executorId) {
         await sendLog('voice', {
           title: '📤 VOICE DISCONNECT',
           description: '**تم فصل العضو من الروم الصوتي**',
@@ -1686,12 +1650,11 @@ client.on(
             },
             {
               name: '🛡️ بواسطة',
-              value: userInfo(executor)
+              value: userInfo(audit.executor)
             }
           ]
         });
       } else {
-        // Normal user leave.
         await sendLog('voice', {
           title: '📤 VOICE LEAVE',
           description: '**العضو خرج من الروم الصوتي**',
@@ -1724,13 +1687,10 @@ client.on(
         30000
       );
 
-      const executor = audit?.executorId
-        ? (audit.executor || await client.users.fetch(audit.executorId).catch(() => null))
-        : null;
-
+      // Self move has no administrative executor and is still a useful log.
       await sendLog('voice', {
         title: '🔁 VOICE MOVE',
-        description: executor
+        description: audit?.executorId
           ? '**تم نقل العضو بين الرومات الصوتية**'
           : '**العضو انتقل بين الرومات الصوتية**',
         color: COLORS.voice,
@@ -1747,8 +1707,8 @@ client.on(
           },
           {
             name: '🛡️ بواسطة',
-            value: executor
-              ? userInfo(executor)
+            value: audit?.executorId
+              ? userInfo(audit.executor)
               : userInfo(user)
           }
         ]
@@ -1833,7 +1793,7 @@ client.on(
     ];
 
     for (const [key, title, description, color] of selfChanges) {
-      if (Boolean(oldState[key]) === Boolean(newState[key])) continue;
+      if (oldState[key] === newState[key]) continue;
 
       await sendLog('voice', {
         title,
@@ -1992,6 +1952,31 @@ client.on(
 // CHANNEL LOGS
 // ============================================
 
+// ============================================
+// CHANNEL TYPE DISPLAY
+// ============================================
+
+function channelTypeName(type) {
+  const types = {
+    0: 'Text',
+    2: 'Voice',
+    4: 'Category',
+    5: 'Announcement',
+    10: 'Announcement Thread',
+    11: 'Thread Public',
+    12: 'Thread Private',
+    13: 'Stage',
+    15: 'Forum'
+  };
+
+  return types[type] || `Unknown (${type})`;
+}
+
+function channelMention(channel) {
+  return channel?.id ? `<#${channel.id}>` : 'غير متاح';
+}
+
+
 client.on(
   Events.ChannelCreate,
   async channel => {
@@ -2018,23 +2003,17 @@ client.on(
         COLORS.success,
       fields: [
         {
-          name: '📌 الاسم',
-          value:
-            `${channel.name}`
+          name: '📍 الروم',
+          value: channelMention(channel)
         },
-
         {
-          name: '🆔 ID',
-          value:
-            `\`${channel.id}\``
+          name: '📌 اسم الروم',
+          value: `\`${channel.name}\``
         },
-
         {
-          name: '📂 النوع',
-          value:
-            `${channel.type}`
+          name: '📂 نوع الروم',
+          value: `\`${channelTypeName(channel.type)}\``
         },
-
         {
           name:
             '🛡️ بواسطة',
@@ -2073,16 +2052,12 @@ client.on(
       fields: [
         {
           name: '📌 الاسم',
-          value:
-            `${channel.name}`
+          value: `\`${channel.name}\``
         },
-
         {
-          name: '🆔 ID',
-          value:
-            `\`${channel.id}\``
+          name: '📂 النوع',
+          value: `\`${channelTypeName(channel.type)}\``
         },
-
         {
           name:
             '🛡️ بواسطة',
@@ -2230,8 +2205,15 @@ client.on(
       fields: [
         {
           name: '📍 الروم',
-          value:
-            `${newChannel.name} • \`${newChannel.id}\``
+          value: channelMention(newChannel)
+        },
+        {
+          name: '📌 اسم الروم',
+          value: `\`${newChannel.name}\``
+        },
+        {
+          name: '📂 نوع الروم',
+          value: `\`${channelTypeName(newChannel.type)}\``
         },
 
         ...(changes.length
@@ -2620,6 +2602,15 @@ client.on(
     ) {
       changes.push(
         `🔔 **قابلة للمنشن:** ${oldRole.mentionable ? 'نعم' : 'لا'} ➜ ${newRole.mentionable ? 'نعم' : 'لا'}`
+      );
+    }
+
+    if (
+      oldRole.position !==
+      newRole.position
+    ) {
+      changes.push(
+        `↕️ **الترتيب:** ${oldRole.position} ➜ ${newRole.position}`
       );
     }
 
@@ -3618,8 +3609,6 @@ client.on(
         }
       }, 60000);
     }
-
-    queueVoiceAuditEntry(guild, entry);
 
     const webhookActions = [
       AuditLogEvent.WebhookCreate,
