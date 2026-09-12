@@ -766,184 +766,65 @@ function getQueuedVoiceAudits(guild, action) {
 
 async function findVoiceAudit(guild, type, memberId, channelId, maxAge = 15000) {
   if (!guild || !memberId) return null;
-
   const types = Array.isArray(type) ? type : [type];
 
   const matches = entry => {
     if (!entry?.executorId) return false;
     if (!isFreshAudit(entry, maxAge)) return false;
-
-    // The executor cannot be the member who left by himself.
     if (entry.executorId === memberId) return false;
+    const consumedUntil = consumedAuditEntries.get(`${guild.id}:${entry.id}`);
+    if (consumedUntil && consumedUntil > Date.now()) return false;
 
     const auditChannel = getAuditChannelId(entry);
     const targetId = entry.targetId ? String(entry.targetId) : null;
     const wantedMemberId = String(memberId);
 
-    const count = getAuditCount(entry);
+    if (channelId && auditChannel && String(auditChannel) !== String(channelId)) return false;
 
-    // --------------------------------------------------
-    // MEMBER DISCONNECT
-    // Discord can put multiple disconnects into ONE
-    // audit-log entry.
-    // --------------------------------------------------
-    if (entry.action === AuditLogEvent.MemberDisconnect) {
+    // Exact target is the strongest correlation. Discord may omit target_id
+    // for MEMBER_DISCONNECT/MEMBER_MOVE and expose only channel_id/count.
+    if (targetId) return targetId === wantedMemberId;
 
-      // If this is a grouped disconnect, DO NOT require
-      // target_id to match the current member.
-      if (count > 1) {
-        if (
-          channelId &&
-          auditChannel &&
-          String(auditChannel) !== String(channelId)
-        ) {
-          return false;
-        }
-
-        return true;
-      }
-
-      // Normal single disconnect.
-      if (targetId) {
-        return targetId === wantedMemberId;
-      }
-
-      if (
-        channelId &&
-        auditChannel &&
-        String(auditChannel) !== String(channelId)
-      ) {
-        return false;
-      }
-
-      return true;
-    }
-
-    // --------------------------------------------------
-    // OTHER VOICE ACTIONS
-    // --------------------------------------------------
-
-    if (channelId && auditChannel) {
-      if (String(auditChannel) !== String(channelId)) {
-        return false;
-      }
-    }
-
-    // For MOVE, target_id should normally identify the member.
-    if (targetId) {
-      return targetId === wantedMemberId;
-    }
-
-    // If Discord omitted target_id, only accept a
-    // single-member audit entry.
-    if (count !== 1) return false;
-
+    // When target_id is missing, accept only a single-member audit action.
+    // Prefer the exact old channel when Discord provides it. If Discord omits
+    // channel_id as well, the fresh single-member entry is still usable because
+    // the VoiceStateUpdate itself identifies the member that just left.
+    if (getAuditCount(entry) !== 1) return false;
+    if (channelId && auditChannel) return String(auditChannel) === String(channelId);
     return true;
   };
 
-  // --------------------------------------------------
-  // CACHE
-  // --------------------------------------------------
-
   for (const action of types) {
-    const cached =
-      voiceAuditCache.get(
-        voiceAuditCacheKey(guild.id, action, memberId)
-      );
-
+    const cached = voiceAuditCache.get(voiceAuditCacheKey(guild.id, action, memberId));
     if (matches(cached)) {
-
-      // IMPORTANT:
-      // Never consume grouped disconnect entries.
-      if (
-        entryIsSingleAudit(cached)
-      ) {
-        markAuditConsumed(guild, cached, 10000);
-      }
-
+      markAuditConsumed(guild, cached, 10000);
       return cached;
     }
   }
 
-  // --------------------------------------------------
-  // QUEUE
-  // --------------------------------------------------
-
   for (const action of types) {
-    const candidates =
-      getQueuedVoiceAudits(guild, action)
-        .filter(matches)
-        .sort(
-          (a, b) =>
-            b.createdTimestamp - a.createdTimestamp
-        );
-
+    const candidates = getQueuedVoiceAudits(guild, action).filter(matches).sort((a,b) => b.createdTimestamp - a.createdTimestamp);
     if (candidates.length) {
       const entry = candidates[0];
-
-      // Grouped disconnects must remain available
-      // for the other members in the same batch.
-      if (getAuditCount(entry) <= 1) {
-        markAuditConsumed(guild, entry, 10000);
-      }
-
+      markAuditConsumed(guild, entry, 10000);
       return entry;
     }
   }
 
-  // --------------------------------------------------
-  // FETCH DISCORD AUDIT LOG
-  // --------------------------------------------------
-
   for (let attempt = 0; attempt < 20; attempt++) {
-
-    if (attempt) {
-      await wait(350);
-    }
-
+    if (attempt) await wait(350);
     for (const action of types) {
       try {
-        const logs =
-          await guild.fetchAuditLogs({
-            type: action,
-            limit: 50
-          });
-
-        const candidates =
-          [...logs.entries.values()]
-            .filter(matches)
-            .sort(
-              (a, b) =>
-                b.createdTimestamp -
-                a.createdTimestamp
-            );
-
-        if (!candidates.length) {
-          continue;
-        }
-
+        const logs = await guild.fetchAuditLogs({ type: action, limit: 50 });
+        const candidates = [...logs.entries.values()].filter(matches).sort((a,b) => b.createdTimestamp - a.createdTimestamp);
+        if (!candidates.length) continue;
         const entry = candidates[0];
-
-        // DO NOT consume grouped disconnect entries.
-        if (getAuditCount(entry) <= 1) {
-          markAuditConsumed(
-            guild,
-            entry,
-            10000
-          );
-        }
-
-        queueVoiceAuditEntry(
-          guild,
-          entry
-        );
-
+        markAuditConsumed(guild, entry, 10000);
+        queueVoiceAuditEntry(guild, entry);
         return entry;
-
       } catch {}
     }
   }
-
   return null;
 }
 
@@ -1771,74 +1652,65 @@ client.on(
     }
 
     // ------------------------------
-// DISCONNECT
-// ------------------------------
-if (disconnected) {
-  // Discord may take a moment to create the audit-log entry.
-  // Wait briefly before deciding that this was a normal leave.
-  await wait(1200);
+    // DISCONNECT
+    // ------------------------------
+    if (disconnected) {
+      const audit = await findVoiceAudit(
+        guild,
+        AuditLogEvent.MemberDisconnect,
+        user.id,
+        oldState.channelId,
+        15000
+      );
 
-  const audit = await findVoiceAudit(
-    guild,
-    AuditLogEvent.MemberDisconnect,
-    user.id,
-    oldState.channelId,
-    20000
-  );
+      const executor = audit?.executorId
+        ? (audit.executor || await client.users.fetch(audit.executorId).catch(() => null))
+        : null;
 
-  const executor = audit?.executorId
-    ? (
-        audit.executor ||
-        await client.users.fetch(audit.executorId).catch(() => null)
-      )
-    : null;
+      if (!audit) {
+        console.warn(`[NMR VOICE] No MemberDisconnect audit match for ${user.id} in ${oldState.channelId || 'unknown-channel'}.`);
+      }
 
-  // ==============================
-  // ADMIN / STAFF DISCONNECT
-  // ==============================
-  if (executor && executor.id !== user.id) {
-    await sendLog('voice', {
-      title: '📤 VOICE DISCONNECT',
-      description: '**تم فصل العضو من الروم الصوتي بواسطة إداري**',
-      color: COLORS.danger,
-      thumbnail: user.displayAvatarURL(),
-      fields: [
-        ...base,
-        {
-          name: '📍 الروم السابق',
-          value: channelText(oldState)
-        },
-        {
-          name: '🛡️ بواسطة',
-          value: userInfo(executor)
-        }
-      ]
-    });
-  }
-
-  // ==============================
-  // NORMAL USER LEAVE
-  // ==============================
-  else {
-    await sendLog('voice', {
-      title: '📤 VOICE LEAVE',
-      description: '**العضو خرج من الروم الصوتي بنفسه**',
-      color: COLORS.warning,
-      thumbnail: user.displayAvatarURL(),
-      fields: [
-        ...base,
-        {
-          name: '📍 الروم السابق',
-          value: channelText(oldState)
-        },
-        {
-          name: '🛡️ بواسطة',
-          value: userInfo(user)
-        }
-      ]
-    });
-  }
-}
+      // Admin disconnect: show the real executor.
+      if (executor) {
+        await sendLog('voice', {
+          title: '📤 VOICE DISCONNECT',
+          description: '**تم فصل العضو من الروم الصوتي**',
+          color: COLORS.warning,
+          thumbnail: user.displayAvatarURL(),
+          fields: [
+            ...base,
+            {
+              name: '📍 الروم السابق',
+              value: channelText(oldState)
+            },
+            {
+              name: '🛡️ بواسطة',
+              value: userInfo(executor)
+            }
+          ]
+        });
+      } else {
+        // Normal user leave.
+        await sendLog('voice', {
+          title: '📤 VOICE LEAVE',
+          description: '**العضو خرج من الروم الصوتي**',
+          color: COLORS.warning,
+          thumbnail: user.displayAvatarURL(),
+          fields: [
+            ...base,
+            {
+              name: '📍 الروم السابق',
+              value: channelText(oldState)
+            },
+            {
+              name: '🛡️ بواسطة',
+              value: userInfo(user)
+            }
+          ]
+        });
+      }
+    }
 
     // ------------------------------
     // MOVE
@@ -2116,31 +1988,6 @@ client.on(
   }
 );
 
-
-// ============================================
-// CHANNEL TYPE DISPLAY
-// ============================================
-
-function channelTypeName(type) {
-  const types = {
-    0: 'Text',
-    2: 'Voice',
-    4: 'Category',
-    5: 'Announcement',
-    10: 'Announcement Thread',
-    11: 'Thread Public',
-    12: 'Thread Private',
-    13: 'Stage',
-    15: 'Forum'
-  };
-
-  return types[type] || `Unknown (${type})`;
-}
-
-function channelMention(channel) {
-  return channel?.id ? `<#${channel.id}>` : 'غير متاح';
-}
-
 // ============================================
 // CHANNEL LOGS
 // ============================================
@@ -2171,17 +2018,23 @@ client.on(
         COLORS.success,
       fields: [
         {
-          name: '📍 الروم',
-          value: channelMention(channel)
+          name: '📌 الاسم',
+          value:
+            `${channel.name}`
         },
+
         {
-          name: '📌 اسم الروم',
-          value: `\`${channel.name}\``
+          name: '🆔 ID',
+          value:
+            `\`${channel.id}\``
         },
+
         {
-          name: '📂 نوع الروم',
-          value: `\`${channelTypeName(channel.type)}\``
+          name: '📂 النوع',
+          value:
+            `${channel.type}`
         },
+
         {
           name:
             '🛡️ بواسطة',
@@ -2220,12 +2073,16 @@ client.on(
       fields: [
         {
           name: '📌 الاسم',
-          value: `\`${channel.name}\``
+          value:
+            `${channel.name}`
         },
+
         {
-          name: '📂 النوع',
-          value: `\`${channelTypeName(channel.type)}\``
+          name: '🆔 ID',
+          value:
+            `\`${channel.id}\``
         },
+
         {
           name:
             '🛡️ بواسطة',
@@ -2373,15 +2230,8 @@ client.on(
       fields: [
         {
           name: '📍 الروم',
-          value: channelMention(newChannel)
-        },
-        {
-          name: '📌 اسم الروم',
-          value: `\`${newChannel.name}\``
-        },
-        {
-          name: '📂 نوع الروم',
-          value: `\`${channelTypeName(newChannel.type)}\``
+          value:
+            `${newChannel.name} • \`${newChannel.id}\``
         },
 
         ...(changes.length
@@ -2417,286 +2267,6 @@ client.on(
             '🛡️ بواسطة',
           value:
             await executorInfo(audit)
-        }
-      ]
-    });
-  }
-);
-
-
-// ============================================
-// THREAD LOGS - PUBLIC / PRIVATE
-// ============================================
-
-function threadTypeName(channel) {
-  if (!channel) return 'Unknown';
-
-  switch (channel.type) {
-    case 10:
-      return 'Announcement Thread';
-    case 11:
-      return 'Public Thread';
-    case 12:
-      return 'Private Thread';
-    default:
-      return 'Thread';
-  }
-}
-
-function threadInfo(channel) {
-  return `${channel}\n\`${channel.id}\``;
-}
-
-// THREAD CREATED
-client.on(
-  Events.ThreadCreate,
-  async thread => {
-    if (
-      !thread.guild ||
-      !isSource(thread.guild)
-    ) {
-      return;
-    }
-
-    const audit = await findAudit(
-      thread.guild,
-      AuditLogEvent.ThreadCreate,
-      thread.id,
-      20000
-    );
-
-    await sendLog('logs', {
-      title: '🧵 THREAD CREATED',
-      description: '**تم إنشاء Thread جديد**',
-      color: COLORS.success,
-
-      fields: [
-        {
-          name: '📍 الروم',
-          value: `${thread}`
-        },
-
-        {
-          name: '📝 اسم الـ Thread',
-          value: code(thread.name, 900)
-        },
-
-        {
-          name: '🔹 النوع',
-          value: code(threadTypeName(thread), 900)
-        },
-
-        {
-          name: '📂 الروم الأساسي',
-          value: thread.parent
-            ? `${thread.parent}`
-            : 'غير متاح'
-        },
-
-        {
-          name: '🆔 ID',
-          value: `\`${thread.id}\``
-        },
-
-        {
-          name: '🛡️ بواسطة',
-          value: await executorInfo(audit, thread.ownerId
-            ? await client.users.fetch(thread.ownerId).catch(() => null)
-            : null)
-        }
-      ]
-    });
-  }
-);
-
-
-// THREAD DELETED
-client.on(
-  Events.ThreadDelete,
-  async thread => {
-    if (
-      !thread.guild ||
-      !isSource(thread.guild)
-    ) {
-      return;
-    }
-
-    const audit = await findAudit(
-      thread.guild,
-      AuditLogEvent.ThreadDelete,
-      thread.id,
-      20000
-    );
-
-    await sendLog('logs', {
-      title: '🗑️ THREAD DELETED',
-      description: '**تم حذف Thread**',
-      color: COLORS.danger,
-
-      fields: [
-        {
-          name: '📍 الروم',
-          value: `#${thread.name}`
-        },
-
-        {
-          name: '📝 الاسم',
-          value: code(thread.name, 900)
-        },
-
-        {
-          name: '🔹 النوع',
-          value: code(threadTypeName(thread), 900)
-        },
-
-        {
-          name: '📂 الروم الأساسي',
-          value: thread.parent
-            ? `${thread.parent}`
-            : 'غير متاح'
-        },
-
-        {
-          name: '🆔 ID',
-          value: `\`${thread.id}\``
-        },
-
-        {
-          name: '🛡️ بواسطة',
-          value: await executorInfo(audit)
-        }
-      ]
-    });
-  }
-);
-
-
-// THREAD UPDATED
-client.on(
-  Events.ThreadUpdate,
-  async (
-    oldThread,
-    newThread
-  ) => {
-    if (
-      !newThread.guild ||
-      !isSource(newThread.guild)
-    ) {
-      return;
-    }
-
-    const changes = [];
-
-    // الاسم
-    if (
-      oldThread.name !==
-      newThread.name
-    ) {
-      changes.push(
-        `📝 **الاسم:** ${oldThread.name} ➜ ${newThread.name}`
-      );
-    }
-
-    // النوع
-    if (
-      oldThread.type !==
-      newThread.type
-    ) {
-      changes.push(
-        `🔹 **النوع:** ${threadTypeName(oldThread)} ➜ ${threadTypeName(newThread)}`
-      );
-    }
-
-    // Archived
-    if (
-      oldThread.archived !==
-      newThread.archived
-    ) {
-      changes.push(
-        `📦 **Archived:** ${oldThread.archived ? 'نعم' : 'لا'} ➜ ${newThread.archived ? 'نعم' : 'لا'}`
-      );
-    }
-
-    // Locked
-    if (
-      oldThread.locked !==
-      newThread.locked
-    ) {
-      changes.push(
-        `🔒 **Locked:** ${oldThread.locked ? 'نعم' : 'لا'} ➜ ${newThread.locked ? 'نعم' : 'لا'}`
-      );
-    }
-
-    // Auto Archive Duration
-    if (
-      oldThread.autoArchiveDuration !==
-      newThread.autoArchiveDuration
-    ) {
-      changes.push(
-        `⏱️ **Auto Archive:** ${oldThread.autoArchiveDuration ?? 'غير محدد'} ➜ ${newThread.autoArchiveDuration ?? 'غير محدد'} دقيقة`
-      );
-    }
-
-    // Slowmode
-    if (
-      oldThread.rateLimitPerUser !==
-      newThread.rateLimitPerUser
-    ) {
-      changes.push(
-        `🐌 **Slowmode:** ${oldThread.rateLimitPerUser ?? 0}s ➜ ${newThread.rateLimitPerUser ?? 0}s`
-      );
-    }
-
-    if (!changes.length) {
-      return;
-    }
-
-    const audit = await findAudit(
-      newThread.guild,
-      AuditLogEvent.ThreadUpdate,
-      newThread.id,
-      30000
-    );
-
-    await sendLog('logs', {
-      title: '✏️ THREAD UPDATED',
-      description: '**تم تعديل Thread**',
-      color: COLORS.warning,
-
-      fields: [
-        {
-          name: '📍 الروم',
-          value: `${newThread}`
-        },
-
-        {
-          name: '📝 الاسم',
-          value: code(newThread.name, 900)
-        },
-
-        {
-          name: '🔹 النوع',
-          value: code(threadTypeName(newThread), 900)
-        },
-
-        {
-          name: '📂 الروم الأساسي',
-          value: newThread.parent
-            ? `${newThread.parent}`
-            : 'غير متاح'
-        },
-
-        {
-          name: '📝 التغييرات',
-          value: trim(
-            changes.join('\n'),
-            1000
-          )
-        },
-
-        {
-          name: '🛡️ بواسطة',
-          value: await executorInfo(audit)
         }
       ]
     });
@@ -3515,35 +3085,41 @@ client.on(
 client.on(
   Events.GuildMemberAdd,
   async member => {
-    if (!isSource(member.guild)) {
+    if (
+      !isSource(member.guild)
+    ) {
       return;
     }
 
-    const invite = await findUsedInvite(member.guild);
+    const invite =
+      await findUsedInvite(
+        member.guild
+      );
 
-    let inviterText = '⚠️ لم يتم تحديد صاحب الدعوة';
+    let inviterText =
+      '⚠️ لم يتم تحديد صاحب الدعوة';
 
     if (invite?.inviter) {
-      inviterText = userInfo(invite.inviter);
-    } else if (invite?.inviterId) {
-      inviterText = `<@${invite.inviterId}>`;
+      inviterText =
+        userInfo(
+          invite.inviter
+        );
+    } else if (
+      invite?.inviterId
+    ) {
+      inviterText =
+        `<@${invite.inviterId}>`;
     }
 
-    // عدد أعضاء السيرفر الحالي
-    const memberCount = member.guild.memberCount;
-
-    // تاريخ إنشاء حساب العضو
-    const accountCreated = Math.floor(
-      member.user.createdTimestamp / 1000
-    );
-
     await sendLog('logs', {
-      title: '📥 MEMBER JOINED',
+      title:
+        '📥 MEMBER JOINED',
 
       description:
         '**عضو جديد دخل السيرفر**',
 
-      color: COLORS.success,
+      color:
+        COLORS.success,
 
       thumbnail:
         member.user.displayAvatarURL(),
@@ -3551,37 +3127,31 @@ client.on(
       fields: [
         {
           name: '👤 العضو',
-          value: userInfo(member.user)
-        },
-
-        {
-          name: '🔗 تمت دعوته بواسطة',
-          value: inviterText
-        },
-
-        {
-          name: '🔑 كود الدعوة',
-          value: invite?.code
-            ? `\`${invite.code}\``
-            : 'غير متاح'
-        },
-
-        {
-          name: '📅 تاريخ إنشاء الحساب',
-          value: `<t:${accountCreated}:F>\n<t:${accountCreated}:R>`
-        },
-
-        {
-          name: '👥 عدد أعضاء السيرفر',
-          value: `\`${memberCount}\` عضو`,
-          inline: true
-        },
-
-        {
-          name: '🕒 وقت الدخول',
           value:
-            `<t:${Math.floor(Date.now() / 1000)}:F>`,
-          inline: true
+            userInfo(member.user)
+        },
+
+        {
+          name:
+            '🔗 تمت دعوته بواسطة',
+          value:
+            inviterText
+        },
+
+        {
+          name:
+            '🔑 كود الدعوة',
+          value:
+            invite?.code
+              ? `\`${invite.code}\``
+              : 'غير متاح'
+        },
+
+        {
+          name:
+            '🕒 وقت الدخول',
+          value:
+            `<t:${Math.floor(Date.now() / 1000)}:F>`
         }
       ]
     });
@@ -3696,7 +3266,7 @@ client.on(
           name:
             '🔗 الدعوة',
           value:
-            `\`discord.gg/${invite.code}\``
+            `discord.gg/${invite.code}`
         },
 
         {
@@ -3741,10 +3311,6 @@ client.on(
   }
 );
 
-// ============================================
-// INVITE DELETE LOG - FIXED AUDIT LOG
-// ============================================
-
 client.on(
   Events.InviteDelete,
   async invite => {
@@ -3755,209 +3321,26 @@ client.on(
       return;
     }
 
-    let audit = null;
-
-    /*
-     * Discord ممكن يسجل InviteDelete في Audit Log
-     * بعد ما يوصل Event للـ Bot.
-     *
-     * لذلك بنعمل عدة محاولات، والأهم:
-     * ما نعتمدش فقط على targetId لأن Discord
-     * ممكن يرجعه بشكل مختلف/غير متوقع.
-     */
-
-    for (let attempt = 0; attempt < 20; attempt++) {
-      try {
-        const logs =
-          await invite.guild.fetchAuditLogs({
-            type: AuditLogEvent.InviteDelete,
-            limit: 50
-          });
-
-        const now = Date.now();
-
-        const entries = [
-          ...logs.entries.values()
-        ]
-          .filter(entry => {
-            if (!entry) return false;
-
-            const created =
-              entry.createdTimestamp || 0;
-
-            const age = now - created;
-
-            // Audit Log لازم يكون حديث
-            if (
-              age < -5000 ||
-              age > 60000
-            ) {
-              return false;
-            }
-
-            return true;
-          })
-          .sort(
-            (a, b) =>
-              b.createdTimestamp -
-              a.createdTimestamp
-          );
-
-        if (entries.length) {
-
-          /*
-           * أولاً نحاول نلاقي الـ entry المطابق
-           * لكود الدعوة لو Discord أرسله.
-           */
-          const exactMatch =
-            entries.find(entry => {
-
-              if (!entry.targetId) {
-                return false;
-              }
-
-              return (
-                String(entry.targetId) ===
-                String(invite.code)
-              );
-            });
-
-          if (exactMatch) {
-            audit = exactMatch;
-          } else {
-
-            /*
-             * لو Discord لم يرسل targetId بالشكل المتوقع،
-             * نستخدم أحدث InviteDelete Audit Log.
-             *
-             * ده مهم لأن Discord أحياناً يكون عنده
-             * Audit Log صحيح لكن targetId لا يطابق
-             * invite.code.
-             */
-            audit = entries[0];
-          }
-
-          if (audit) {
-            break;
-          }
-        }
-
-      } catch (error) {
-        console.warn(
-          '[NMR INVITE DELETE] Audit fetch failed:',
-          error.message
-        );
-      }
-
-      // ندي Discord وقت يسجل الـ Audit Log
-      await wait(500);
-    }
-
-    // ============================================
-    // GET REAL EXECUTOR
-    // ============================================
-
-    let executor = null;
-
-    if (audit) {
-
-      // Discord.js أحياناً يكون جاب executor بالفعل
-      if (audit.executor) {
-        executor = audit.executor;
-      }
-
-      // لو مش موجود، نجيبه بالـ ID
-      if (
-        !executor &&
-        audit.executorId
-      ) {
-        executor =
-          await client.users
-            .fetch(audit.executorId)
-            .catch(() => null);
-      }
-    }
-
-    // ============================================
-    // SEND LOG
-    // ============================================
+    const audit = await findAudit(
+      invite.guild,
+      AuditLogEvent.InviteDelete,
+      invite.code,
+      20000
+    );
 
     await sendLog('logs', {
       title:
         '🗑️ INVITE DELETED',
-
       description:
-        '**تم حذف دعوة من السيرفر**',
-
+        '**تم حذف دعوة**',
       color:
         COLORS.danger,
-
       fields: [
         {
           name:
-            '🔗 الدعوة',
-
+            '🔗 Code',
           value:
-            `\`discord.gg/${invite.code}\``
-        },
-
-        {
-          name:
-            '🔑 Code',
-
-          value:
-            `\`${invite.code}\``
-        },
-
-        {
-          name:
-            '📍 الروم',
-
-          value:
-            invite.channel
-              ? `${invite.channel}`
-              : 'بيانات الروم غير متاحة'
-        },
-
-        {
-          name:
-            '🛡️ تم الحذف بواسطة',
-
-          value:
-            executor
-              ? userInfo(executor)
-              : audit?.executorId
-                ? `<@${audit.executorId}>`
-                : '⚠️ غير محدد - لم يتم العثور على منفذ العملية'
-        },
-
-        {
-          name:
-            '📝 السبب',
-
-          value:
-            audit?.reason ||
-            'لم يتم تقديم سبب'
-        },
-
-        {
-          name:
-            '🆔 Audit Log ID',
-
-          value:
-            audit?.id
-              ? `\`${audit.id}\``
-              : 'غير متاح'
-        },
-
-        {
-          name:
-            '🕒 وقت الحذف',
-
-          value:
-            `<t:${Math.floor(
-              Date.now() / 1000
-            )}:F>`
+            invite.code
         }
       ]
     });
