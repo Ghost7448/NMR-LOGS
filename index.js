@@ -785,30 +785,50 @@ async function findVoiceAudit(guild, type, memberId, channelId, maxAge = 15000) 
     // for MEMBER_DISCONNECT/MEMBER_MOVE and expose only channel_id/count.
     if (targetId) return targetId === wantedMemberId;
 
-    // When target_id is missing, accept only a single-member audit action.
-    // Prefer the exact old channel when Discord provides it. If Discord omits
-    // channel_id as well, the fresh single-member entry is still usable because
-    // the VoiceStateUpdate itself identifies the member that just left.
-    if (getAuditCount(entry) !== 1) return false;
-    if (channelId && auditChannel) return String(auditChannel) === String(channelId);
-    return true;
+    // Discord can group multiple disconnects into one audit-log entry.
+if (entry.action === AuditLogEvent.MemberDisconnect) {
+  const count = getAuditCount(entry);
+
+  if (count < 1) return false;
+
+  if (channelId && auditChannel) {
+    return String(auditChannel) === String(channelId);
+  }
+
+  return true;
+}
+
+// Other voice actions stay strict.
+if (getAuditCount(entry) !== 1) return false;
+
+if (channelId && auditChannel) {
+  return String(auditChannel) === String(channelId);
+}
+
+return true;
   };
 
   for (const action of types) {
     const cached = voiceAuditCache.get(voiceAuditCacheKey(guild.id, action, memberId));
     if (matches(cached)) {
-      markAuditConsumed(guild, cached, 10000);
-      return cached;
-    }
+  if (getAuditCount(cached) === 1) {
+    markAuditConsumed(guild, cached, 10000);
+  }
+  return cached;
+}
   }
 
   for (const action of types) {
     const candidates = getQueuedVoiceAudits(guild, action).filter(matches).sort((a,b) => b.createdTimestamp - a.createdTimestamp);
     if (candidates.length) {
-      const entry = candidates[0];
-      markAuditConsumed(guild, entry, 10000);
-      return entry;
-    }
+  const entry = candidates[0];
+
+  if (getAuditCount(entry) === 1) {
+    markAuditConsumed(guild, entry, 10000);
+  }
+
+  return entry;
+}
   }
 
   for (let attempt = 0; attempt < 20; attempt++) {
@@ -819,9 +839,13 @@ async function findVoiceAudit(guild, type, memberId, channelId, maxAge = 15000) 
         const candidates = [...logs.entries.values()].filter(matches).sort((a,b) => b.createdTimestamp - a.createdTimestamp);
         if (!candidates.length) continue;
         const entry = candidates[0];
-        markAuditConsumed(guild, entry, 10000);
-        queueVoiceAuditEntry(guild, entry);
-        return entry;
+
+if (getAuditCount(entry) === 1) {
+  markAuditConsumed(guild, entry, 10000);
+}
+
+queueVoiceAuditEntry(guild, entry);
+return entry;
       } catch {}
     }
   }
